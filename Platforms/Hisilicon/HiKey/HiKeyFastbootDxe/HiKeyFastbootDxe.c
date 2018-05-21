@@ -133,7 +133,7 @@ ReadPartitionEntries (
       GptHeader->MyLBA != 1) {
     DEBUG ((EFI_D_ERROR,
       "Fastboot platform: No GPT on flash. "
-      "Fastboot on Versatile Express does not support MBR.\n"
+      "Fastboot on HiKey does not support MBR.\n"
       ));
     return EFI_DEVICE_ERROR;
   }
@@ -280,8 +280,12 @@ HiKeyFlashPtable (
   EFI_STATUS               Status;
   EFI_DISK_IO_PROTOCOL    *DiskIo;
   UINT32                   MediaId;
+  VOID                    *Buffer;
+  UINT32                   EntrySize, EntryOffset;
+  UINTN                    BlockSize;
 
   MediaId = mFlashBlockIo->Media->MediaId;
+  BlockSize = mFlashBlockIo->Media->BlockSize;
   Status = gBS->OpenProtocol (
                   mFlashHandle,
                   &gEfiDiskIoProtocolGuid,
@@ -293,9 +297,33 @@ HiKeyFlashPtable (
   if (EFI_ERROR (Status)) {
     return Status;
   }
-  Status = DiskIo->WriteDisk (DiskIo, MediaId, 0, Size, Image);
-  if (EFI_ERROR (Status)) {
-    return Status;
+  Buffer = Image;
+  if (AsciiStrnCmp (Buffer, "ENTRYHDR", 8) != 0) {
+    DEBUG ((EFI_D_ERROR, "It should be raw ptable image\n"));
+    Status = DiskIo->WriteDisk (DiskIo, MediaId, 0, Size, Image);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+  } else {
+    /* ptable with entry header */
+    Buffer += 8;
+    if (AsciiStrnCmp (Buffer, "primary", 7) != 0) {
+      DEBUG ((EFI_D_ERROR, "unknown ptable imag\n"));
+      return EFI_UNSUPPORTED;
+    }
+    Buffer += 8;
+    EntryOffset = *(UINT32 *)Buffer * BlockSize;
+    Buffer += 4;
+    EntrySize = *(UINT32 *)Buffer * BlockSize;
+    if ((EntrySize + BlockSize) > Size) {
+      DEBUG ((DEBUG_ERROR, "Entry size doesn't match\n"));
+      return EFI_UNSUPPORTED;
+    }
+    Buffer = Image + BlockSize;
+    Status = DiskIo->WriteDisk (DiskIo, MediaId, EntryOffset, EntrySize, Buffer);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
   }
   FreePartitionList ();
   Status = LoadPtable ();
@@ -512,7 +540,8 @@ HiKeyFastbootPlatformGetVar (
   } else if ( !AsciiStrnCmp (Name, "partition-type", 14)) {
       DEBUG ((DEBUG_ERROR, "Fastboot platform: check for partition-type:%a\n", (Name + 15)));
     if ( !AsciiStrnCmp  ( (Name + 15) , "system", 6) || !AsciiStrnCmp  ( (Name + 15) , "userdata", 8)
-            || !AsciiStrnCmp  ( (Name + 15) , "cache", 5)) {
+            || !AsciiStrnCmp  ( (Name + 15) , "cache", 5)
+            || !AsciiStrnCmp  ( (Name + 15) , "vendor", 6)) {
       AsciiStrCpy (Value, "ext4");
     } else {
       AsciiStrCpy (Value, "raw");
@@ -534,15 +563,32 @@ HiKeyFastbootPlatformOemCommand (
 {
   EFI_STATUS   Status;
   CHAR16       UnicodeSN[SERIAL_NUMBER_SIZE];
+  UINTN        Size;
 
+  Size = AsciiStrLen ("serialno");
   if (AsciiStrCmp (Command, "Demonstrate") == 0) {
     DEBUG ((DEBUG_ERROR, "ARM OEM Fastboot command 'Demonstrate' received.\n"));
     return EFI_SUCCESS;
-  } else if (AsciiStrCmp (Command, "serialno") == 0) {
-    Status = GenerateUsbSN (UnicodeSN);
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "Failed to generate USB Serial Number.\n"));
-      return Status;
+  } else if (AsciiStrnCmp (Command, "serialno", Size) == 0) {
+    while (*(Command + Size) == ' ') {
+      Size++;
+    }
+    if (AsciiStrnCmp (Command + Size, "set", AsciiStrLen ("set")) == 0) {
+      Size += AsciiStrLen ("set");
+      while (*(Command + Size) == ' ') {
+        Size++;
+      }
+      Status = AssignUsbSN (Command + Size, UnicodeSN);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_ERROR, "Failed to set USB Serial Number.\n"));
+        return Status;
+      }
+    } else {
+      Status = GenerateUsbSN (UnicodeSN);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_ERROR, "Failed to generate USB Serial Number.\n"));
+        return Status;
+      }
     }
     Status = StoreSNToBlock (mFlashHandle, SERIAL_NUMBER_LBA, UnicodeSN);
     return Status;
